@@ -1,4 +1,4 @@
-#!/usr/bin/env sh
+#!/usr/bin/env bash
 
 # Follow however many symlinks are needed to get the true directory and name of this script
 SOURCE=${BASH_SOURCE[0]}
@@ -21,7 +21,7 @@ function main {
     local group=""
 
     # --- Command ---
-    local cmd="python -m ${SCRIPT_NAME}"
+    local cmd="python -m supaernova"
 
     # --- Args ---
     for arg in "${@}"; do
