@@ -698,6 +698,8 @@ class NFlow(ModelStep[NFlowConfig]):
             results = self.results.models[dt[:-1]]
 
             mask = getattr(self.model, f"{dt}mask")[:, 0].numpy().astype(bool)
+            if not np.any(mask):
+                continue
 
             u_latents = self.model.z_to_u(results.z_latents, permute=True).numpy()
             z_latents = self.model.u_to_z(u_latents, permute=True).numpy()

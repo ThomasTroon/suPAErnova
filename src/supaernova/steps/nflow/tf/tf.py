@@ -307,9 +307,9 @@ class TFNFlowModel(ks.Model):
             ) / tf.reduce_sum(cov_mask)
         else:
             loss_cov = tf.convert_to_tensor(0, dtype=latents.dtype)
-        pp(loss_cov, "loss_cov")
+        #pp(loss_cov, "loss_cov")
         cov_loss = loss_cov * self.loss_covariance_penalty
-        pp(cov_loss, "cov_loss")
+        #pp(cov_loss, "cov_loss")
         log_prob = self.flow.log_prob(latents)
         # pp(cov_loss, "cov_loss")
         # pp(log_prob, "log_prob")
