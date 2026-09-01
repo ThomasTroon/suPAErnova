@@ -11,7 +11,7 @@ def WHuber(
     y_true: "tf.Tensor", y_pred: "tf.Tensor", *, model: "ks.Model", reduce: bool = True
 ) -> "tf.Tensor":
     mask = tf.cast(model._loss.input_mask, tf.bool)
-    d_amp = model._loss.input_d_amp
+    d_amp = tf.maximum(model._loss.input_d_amp, 1e-5)
 
     error = tf.where(
         mask, tf.abs(y_true - y_pred) / d_amp, tf.zeros_like(mask, tf.float32)

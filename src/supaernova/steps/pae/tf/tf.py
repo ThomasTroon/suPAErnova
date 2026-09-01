@@ -242,13 +242,16 @@ class TFPAEEncoder(ks.layers.Layer):
         x = self.encode_output_layer(x, training=training)
 
         # Latent tensor is the average of the latent values over all unmasked spectra
+        mask_spec_f = tf.cast(mask_spec, x.dtype)
+        
         latents = (
-            tf.reduce_sum(tf.where(mask_spec, x, tf.zeros_like(x)), axis=-2)
+            tf.reduce_sum(x * mask_spec_f, axis=-2)
             / n_unmasked_spec
         )
 
         # Zero out latents of masked SNe
-        latents = tf.where(mask_sn, latents, tf.zeros_like(latents))
+        mask_sn_f = tf.cast(mask_sn, latents.dtype)
+        latents = latents * mask_sn_f
 
         if training:
             # latents_mean = tf.nn.weighted_moments(
@@ -256,9 +259,7 @@ class TFPAEEncoder(ks.layers.Layer):
             # )[0]
             # latents_mean = tfp.stats.percentile(latents, 50.0, axis=0)
             latents_mean = (
-                tf.reduce_sum(
-                    tf.where(mask_sn, latents, tf.zeros_like(latents)), axis=0
-                )
+                tf.reduce_sum(latents * mask_sn_f, axis=0)
                 / n_unmasked_sn
             )
         else:
@@ -492,7 +493,8 @@ class TFPAEDecoder(ks.layers.Layer):
         if self.physical_latents:
             # Calculate Colourlaw
             colourlaw = self.colourlaw_layer(delta_av_latent, training=training)
-            amplitude *= tf.pow(10.0, -0.4 * (colourlaw + delta_m_latent))
+            ext_exponent = tf.clip_by_value(-0.4 * (colourlaw + delta_m_latent), -10.0, 10.0)
+            amplitude *= tf.pow(10.0, ext_exponent)
 
         if not (training or testing):
             amplitude = tf.nn.relu(amplitude)
