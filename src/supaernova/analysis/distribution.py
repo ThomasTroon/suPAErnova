@@ -95,10 +95,34 @@ class DistributionPlotter(Plotter):
                     else:
                         chains[name]["log_posterior"] = log_posterior
 
+        # Clean chains of non-finite rows and zero-variance columns to prevent KDE boundary errors
+        cleaned_chains = {}
+        for name, chain in chains.items():
+            if isinstance(chain, pd.DataFrame):
+                # Drop infs/nans
+                df = chain.replace([np.inf, -np.inf], np.nan).dropna()
+                if len(df) > 1:
+                    # Keep only columns that have non-zero variation
+                    std = df.std(numeric_only=True)
+                    valid_cols = std[std > 1e-8].index
+                    if len(valid_cols) > 0:
+                        cleaned_chains[name] = df[valid_cols]
+            elif isinstance(chain, np.ndarray):
+                valid_rows = np.all(np.isfinite(chain), axis=-1)
+                arr = chain[valid_rows]
+                if len(arr) > 1:
+                    ptp = np.ptp(arr, axis=0)
+                    valid_cols = np.where(ptp > 1e-8)[0]
+                    if len(valid_cols) > 0:
+                        cleaned_chains[name] = arr[:, valid_cols]
+
+        if not cleaned_chains:
+            cleaned_chains = chains
+
         try:
-            fig, ax = Plotter.corner(chains, fig=fig, ax=ax, chain_kwargs=chain_kwargs)
+            fig, ax = Plotter.corner(cleaned_chains, fig=fig, ax=ax, chain_kwargs=chain_kwargs)
         except Exception as e:
-            print("ERROR:")
+            print("ERROR in Plotter.corner:")
             print(e)
             return None, None
         fig.suptitle((config.plot_kwargs or {}).get("title", config.name.capitalize()))

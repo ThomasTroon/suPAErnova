@@ -13,6 +13,8 @@ from matplotlib.colors import ListedColormap, LinearSegmentedColormap
 import matplotlib.pyplot as plt
 from chainconsumer.truth import Truth
 
+import pandas as pd
+
 COLOURS = (
     np.array([
         [166, 206, 227, 255],
@@ -312,11 +314,44 @@ class Plotter:
                         chain_opts[k] = v[name]
                 else:
                     chain_opts[k] = v
+
+            # Filter non-finite samples and zero-variance columns to protect ChainConsumer KDE
+            filtered_chain = chain
+            if isinstance(chain, pd.DataFrame):
+                # 1. Replace infs and drop any row with NaN
+                clean_df = chain.replace([np.inf, -np.inf], np.nan).dropna()
+                
+                # 2. Filter out unphysical extreme outlier values (> 1e4 or < -1e4)
+                numeric_cols = clean_df.select_dtypes(include=[np.number]).columns
+                mask = (clean_df[numeric_cols].abs() < 1e4).all(axis=1)
+                clean_df = clean_df[mask]
+
+                if len(clean_df) > 1:
+                    # 3. Only keep columns with strictly more than 1 unique value and ptp > 1e-5
+                    valid_cols = [
+                        col for col in clean_df.columns
+                        if clean_df[col].nunique() > 1 and (clean_df[col].max() - clean_df[col].min()) > 1e-5
+                    ]
+                    if len(valid_cols) > 0:
+                        filtered_chain = clean_df[valid_cols]
+                    else:
+                        filtered_chain = clean_df
+            elif isinstance(chain, np.ndarray):
+                valid_rows = np.all(np.isfinite(chain) & (np.abs(chain) < 1e4), axis=-1)
+                clean_chain = chain[valid_rows]
+                if clean_chain.shape[0] > 1:
+                    ptp = np.ptp(clean_chain, axis=0)
+                    valid_idx = np.where(ptp > 1e-5)[0]
+                    if len(valid_idx) > 0:
+                        filtered_chain = clean_chain[:, valid_idx]
+                        if "parameters" in chain_opts and isinstance(chain_opts["parameters"], list):
+                            chain_opts["parameters"] = [chain_opts["parameters"][i] for i in valid_idx]
+
             c.add_chain(
                 cc.Chain(
                     *chain_args,
                     *args,
-                    samples=chain,
+                    samples=filtered_chain,
                     name=str(name),
                     **chain_opts,
                     **kwargs,
@@ -325,8 +360,14 @@ class Plotter:
             if "truth" in chain_opts:
                 c.add_truth(Truth(location=chain_opts["truth"]))
 
-        fig = c.plotter.plot(*plot_args, *args, **plot_kwargs, **kwargs)
-        ax = fig.gca()
+        try:
+            fig = c.plotter.plot(*plot_args, *args, **plot_kwargs, **kwargs)
+            ax = fig.gca()
+        except Exception as e:
+            import matplotlib.pyplot as plt
+            fig, ax = plt.subplots()
+            ax.text(0.5, 0.5, f"Plot error: {e}", ha="center", va="center")
+
         return fig, ax
 
     @staticmethod

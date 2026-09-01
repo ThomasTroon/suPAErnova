@@ -509,12 +509,10 @@ class DispersionPlotter(Plotter):
         # snpae_mask &= u_mask
 
         # === Peak Mask ===
+        # Spectrum within 5 days of max after accounting for DeltaP
         max_delta_p = hmcs[0].hmc.delta_p[
-            np.argmin(
-                np.abs(
-                    hmcs[0].hmc.log_prob
-                    - np.max(hmcs[0].hmc.log_prob, axis=0)[None, ...]
-                ),
+            np.nanargmax(
+                np.nan_to_num(hmcs[0].hmc.log_prob, nan=-np.inf),
                 axis=0,
             ),
             np.arange(hmcs[0].hmc.delta_p.shape[-1]),

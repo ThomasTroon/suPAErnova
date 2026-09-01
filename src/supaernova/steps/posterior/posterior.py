@@ -306,22 +306,22 @@ class Posterior(ModelStep[PosteriorConfig]):
                 k: v[:-ind_split] for k, v in self.train_data.model_dump().items()
             })
 
-        self.min_redshift = self.options.min_redshift or max(
+        self.min_redshift = self.options.min_redshift if self.options.min_redshift is not None else max(
             nflow.min_redshift,
             pae.min_redshift,
             data.min_redshift,
         )
-        self.max_redshift = self.options.max_redshift or min(
+        self.max_redshift = self.options.max_redshift if self.options.max_redshift is not None else min(
             nflow.max_redshift,
             pae.max_redshift,
             data.max_redshift,
         )
-        self.min_train_redshift = self.options.min_train_redshift or self.min_redshift
-        self.max_train_redshift = self.options.max_train_redshift or self.max_redshift
-        self.min_test_redshift = self.options.min_test_redshift or self.min_redshift
-        self.max_test_redshift = self.options.max_test_redshift or self.max_redshift
-        self.min_val_redshift = self.options.min_val_redshift or self.min_redshift
-        self.max_val_redshift = self.options.max_val_redshift or self.max_redshift
+        self.min_train_redshift = self.options.min_train_redshift if self.options.min_train_redshift is not None else self.min_redshift
+        self.max_train_redshift = self.options.max_train_redshift if self.options.max_train_redshift is not None else self.max_redshift
+        self.min_test_redshift = self.options.min_test_redshift if self.options.min_test_redshift is not None else self.min_redshift
+        self.max_test_redshift = self.options.max_test_redshift if self.options.max_test_redshift is not None else self.max_redshift
+        self.min_val_redshift = self.options.min_val_redshift if self.options.min_val_redshift is not None else self.min_redshift
+        self.max_val_redshift = self.options.max_val_redshift if self.options.max_val_redshift is not None else self.max_redshift
 
         self.min_phase = self.options.min_phase or max(
             nflow.min_phase, pae.min_phase, data.min_phase
@@ -373,19 +373,29 @@ class Posterior(ModelStep[PosteriorConfig]):
         self.step_sizes = {}
         self.recon_error = {}
         self.recon_error_centers = {}
-        for subset in self.subsets:
+        valid_subsets = []
+        for subset in list(self.subsets):
             # --- ULatent Bounds ---
             nearest = 5
             nflow_subset = nflow.models[subset]
             z_latents = nflow_subset.z_latents
             u_latents = nflow_subset.u_latents
-            mask = getattr(self.nflow, f"{subset}_mask")[..., None]
-            sn_mask = getattr(self.nflow, f"{subset}_sn_mask")
-            spec_mask = getattr(self.nflow, f"{subset}_spec_mask")
-            wl_mask = getattr(self.nflow, f"{subset}_wl_mask")
-            mask_sn = np.any(
-                np.any(mask & wl_mask & spec_mask & sn_mask, axis=-1), axis=-1
-            )
+            mask = getattr(self, f"{subset}_mask")
+            sn_mask = getattr(self, f"{subset}_sn_mask")
+            spec_mask = getattr(self, f"{subset}_spec_mask")
+            wl_mask = getattr(self, f"{subset}_wl_mask")
+            #print(f'=== CHECKING {subset} ===')
+            #print(f'mask sum: {np.sum(mask)}, shape: {mask.shape}')
+            #print(f'wl_mask sum: {np.sum(wl_mask)}, shape: {wl_mask.shape}')
+            #print(f'spec_mask sum: {np.sum(spec_mask)}, shape: {spec_mask.shape}')
+            #print(f'sn_mask sum: {np.sum(sn_mask)}, shape: {sn_mask.shape}')
+            combined_mask = (mask != 0) & (wl_mask != 0) & (spec_mask != 0) & (sn_mask != 0)
+            #print(f'combined_mask sum: {np.sum(combined_mask)}')
+            mask_sn = np.any(np.any(combined_mask, axis=-1), axis=-1)
+            #print(f'mask_sn sum: {np.sum(mask_sn)}')
+            if not np.any(mask_sn):
+                continue
+            valid_subsets.append(subset)
             u_latents_min = np.min(u_latents[mask_sn], axis=0) / nearest
             u_latents_max = np.max(u_latents[mask_sn], axis=0) / nearest
             u_latents_min = (
@@ -413,13 +423,13 @@ class Posterior(ModelStep[PosteriorConfig]):
             pae_subset = pae.stages[subset][str(pae.model.stage.stage)]
             z_latents = pae_subset.latents
             zs = z_latents[..., :-2] if self.pae.physical_latents else z_latents
-            u_latents = self.nflow.z_to_u(zs, permute=True)
-            mask = getattr(self.pae.stage, f"{subset}_mask")
-            sn_mask = getattr(self.pae.stage, f"{subset}_sn_mask")
-            spec_mask = getattr(self.pae.stage, f"{subset}_spec_mask")
-            wl_mask = getattr(self.pae.stage, f"{subset}_wl_mask")
+            u_latents = self.nflow.z_to_u(zs, permute=True).numpy()
+            mask = getattr(self, f"{subset}_mask")
+            sn_mask = getattr(self, f"{subset}_sn_mask")
+            spec_mask = getattr(self, f"{subset}_spec_mask")
+            wl_mask = getattr(self, f"{subset}_wl_mask")
             mask_sn = np.any(
-                np.any(mask & wl_mask & spec_mask & sn_mask, axis=-1), axis=-1
+                np.any((mask != 0) & (wl_mask != 0) & (spec_mask != 0) & (sn_mask != 0), axis=-1), axis=-1
             )
             step_sizes = []
             if self.train_delta_m:
@@ -439,7 +449,7 @@ class Posterior(ModelStep[PosteriorConfig]):
             if self.train_bias:
                 bias_step_size = np.array(self.bias_std)
                 step_sizes.append(bias_step_size)
-            u_latent_step_size = np.std(u_latents[mask_sn], axis=0)
+            u_latent_step_size = np.std(u_latents[mask_sn != 0], axis=0)
             step_sizes.append(u_latent_step_size)
             step_sizes = np.concatenate(step_sizes, axis=-1)
             self.step_sizes[subset] = step_sizes
@@ -493,6 +503,7 @@ class Posterior(ModelStep[PosteriorConfig]):
 
             self.recon_error[subset] = recon_error
             self.recon_error_centers[subset] = recon_error_centers
+        self.subsets = valid_subsets
 
         # --- Stages ---
         i = 0
@@ -1112,7 +1123,7 @@ class Posterior(ModelStep[PosteriorConfig]):
                     o.plot_kwargs["label"] = (
                         f"PAE\n(log prob: {mean_pae_log_prior:.2E} + {mean_pae_log_like:.2E} = {mean_pae_log_prob:.2E})"
                     )
-                    pp(pae_position[0, ...][np.any(mask, axis=(-2, -1))])
+                    #pp(pae_position[0, ...][np.any(mask, axis=(-2, -1))])
 
                 data.amplitude = pae_amplitude.numpy()
                 data.sigma = pae_sigma.numpy()
@@ -1216,7 +1227,7 @@ class Posterior(ModelStep[PosteriorConfig]):
                     o.plot_kwargs["label"] = (
                         f"MAP\n(log prob: {mean_map_log_prior:.2E} + {mean_map_log_like:.2E} = {mean_map_log_prob:.2E})"
                     )
-                    pp(map_position[0, ...][np.any(mask, axis=(-2, -1))])
+                    #pp(map_position[0, ...][np.any(mask, axis=(-2, -1))])
 
                 data.amplitude = map_amplitude.numpy()
                 data.sigma = map_sigma.numpy()
@@ -1337,7 +1348,7 @@ class Posterior(ModelStep[PosteriorConfig]):
                     o.plot_kwargs["label"] = (
                         f"Posterior\n(log prob: {mean_pos_log_prior:.2E} + {mean_pos_log_like:.2E} = {mean_pos_log_prob:.2E})"
                     )
-                    pp(pos_position[0, ...][np.any(mask, axis=(-2, -1))])
+                    #pp(pos_position[0, ...][np.any(mask, axis=(-2, -1))])
 
                 data.amplitude = pos_amplitude.numpy()
                 data.sigma = pos_sigma.numpy()
@@ -2248,7 +2259,7 @@ class Posterior(ModelStep[PosteriorConfig]):
                     # Determine which SNe to keep
                     # Will mask out any SN with *no* unmasked spectra
                     mask_sn = np.any(mask_spec, axis=-1)
-                    sn_mask &= mask_sn
+                    sn_mask = sn_mask & (mask_sn != 0)
 
                 samples = samples[..., sn_mask, :]
                 log_prob = log_prob[..., sn_mask]
@@ -2393,10 +2404,10 @@ class Posterior(ModelStep[PosteriorConfig]):
                 results = self.results[subset][str(seed)]
 
                 data = model.data
-                input_mask = model.data_mask.copy()
-                input_sn_mask = model.sn_mask.copy()
-                input_spec_mask = model.spec_mask.copy()
-                input_wl_mask = model.wl_mask.copy()
+                input_mask = (model.data_mask != 0)
+                input_sn_mask = (model.sn_mask != 0)
+                input_spec_mask = (model.spec_mask != 0)
+                input_wl_mask = (model.wl_mask != 0)
 
                 map_init_results = []
                 map_best_results = []
@@ -2437,6 +2448,8 @@ class Posterior(ModelStep[PosteriorConfig]):
                         input_wl_mask.copy(),
                     )
                 except Exception as e:
+                    #import traceback
+                    #traceback.print_exc()
                     self.log.warning(e)
 
                 try:
@@ -2607,11 +2620,12 @@ class Posterior(ModelStep[PosteriorConfig]):
             input_redshift = data.redshift
             input_phase = data.phase
             input_wavelength = data.wavelength
-            input_mask = data.mask.astype(bool)
+            input_mask = (data.mask != 0)
             data.clear()
 
             min_redshift: float = getattr(self, f"min_{mask_type}redshift")
             max_redshift: float = getattr(self, f"max_{mask_type}redshift")
+            #print(f'DEBUG setup_data_masks {mask_type}: min_z={min_redshift}, max_z={max_redshift}, data_z=[{np.min(input_redshift)}, {np.max(input_redshift)}]')
             redshift_mask = (
                 (input_redshift >= min_redshift) & (input_redshift <= max_redshift)
             )[:, 0:1, 0:1]
@@ -2710,10 +2724,10 @@ class PosteriorStep(Model[PosteriorStepConfig, Posterior]):
                     ).tolist()
 
                     data = model.data
-                    input_mask = model.data_mask
-                    input_sn_mask = model.sn_mask
-                    input_spec_mask = model.spec_mask
-                    input_wl_mask = model.wl_mask
+                    input_mask = (model.data_mask != 0)
+                    input_sn_mask = (model.sn_mask != 0)
+                    input_spec_mask = (model.spec_mask != 0)
+                    input_wl_mask = (model.wl_mask != 0)
 
                     map_init_results = []
                     map_best_results = []
@@ -2907,7 +2921,7 @@ class PosteriorStep(Model[PosteriorStepConfig, Posterior]):
                     # Determine which SNe to keep
                     # Will mask out any SN with *no* unmasked spectra
                     mask_sn = np.any(mask_spec, axis=-1)
-                    sn_mask &= mask_sn
+                    sn_mask = sn_mask & (mask_sn != 0)
 
                 samples = samples[..., sn_mask, :]
                 log_prob = log_prob[..., sn_mask]
@@ -2947,8 +2961,17 @@ class PosteriorStep(Model[PosteriorStepConfig, Posterior]):
                 if name not in v_weights and weights is not None:
                     v_weights[name] = {}
 
+                # Drop parameters with zero variance across the ensemble to prevent ChainConsumer KDE errors
+                std = np.nanstd(chains, axis=0)
+                valid_idx = np.where(std > 1e-12)[0]
+                if len(valid_idx) > 0:
+                    chains = chains[:, valid_idx]
+                    filtered_labels = {new_i: hmc_labels[old_i] for new_i, old_i in enumerate(valid_idx) if old_i in hmc_labels}
+                else:
+                    filtered_labels = hmc_labels
+
                 v_chain_data[name][title] = chains
-                v_labels[name][title] = hmc_labels
+                v_labels[name][title] = filtered_labels
                 if weights is not None:
                     v_weights[name][title] = weights
                 v_opts[name] = o

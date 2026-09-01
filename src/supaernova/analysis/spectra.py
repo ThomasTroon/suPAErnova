@@ -90,19 +90,28 @@ class SpectraPlotter(Plotter):
         sigma = data.sigma.copy()
         sn_name = data.sn_name.copy()
         time = data.phase.copy() if phase else data.time.copy()
+
+        # Coerce base mask to boolean without safe-casting errors
         input_mask = (
-            np.ones_like(data.mask, dtype=np.bool) if mask is None else mask.copy()
+            np.ones_like(data.mask, dtype=bool)
+            if mask is None
+            else (mask != 0)
         )
 
         # Wavelength Range Mask
-        input_wl_mask = np.ones_like(input_mask) if wl_mask is None else wl_mask.copy()
+        input_wl_mask = (
+            np.ones_like(input_mask, dtype=bool)
+            if wl_mask is None
+            else (wl_mask != 0)
+        )
 
         if config.filter is not None:
             for key, constraints in config.filter.items():
                 value = getattr(data, key)
                 for comparison, constraint in constraints.items():
                     compare = CONSTRAINTS[comparison]
-                    input_wl_mask &= compare(value, constraint)
+                    cond = compare(value, constraint)
+                    input_wl_mask = input_wl_mask & (cond != 0)
 
         # Selected Spectra/Photometry Mask
         # A row can only be used if it was actually selected as a spectrum or
@@ -122,19 +131,26 @@ class SpectraPlotter(Plotter):
         input_spec_mask = (
             input_wl_mask.any(axis=-1, keepdims=True)
             if spec_mask is None
-            else spec_mask.copy()
+            else (spec_mask != 0)
         )
+
         # Redshift Range Mask
         input_sn_mask = (
             input_spec_mask.any(axis=-2, keepdims=True)
             if sn_mask is None
-            else sn_mask.copy()
+            else (sn_mask != 0)
         )
 
-        input_spec_mask &= input_wl_mask.any(axis=-1, keepdims=True)
-        input_sn_mask &= input_spec_mask.any(axis=-2, keepdims=True)
-        input_mask &= input_sn_mask & input_spec_mask & input_wl_mask
-        input_mask &= (input_spectra_mask | input_phot_mask).astype(np.bool)
+        input_spec_mask = (
+            input_spec_mask.any(axis=-2, keepdims=True)
+            if sn_mask is None
+            else (sn_mask != 0)
+        )
+
+        input_spec_mask = input_spec_mask & input_wl_mask.any(axis=-1, keepdims=True)
+        input_sn_mask = input_sn_mask & input_spec_mask.any(axis=-2, keepdims=True)
+        input_mask = input_mask & input_sn_mask & input_spec_mask & input_wl_mask
+        input_mask = input_mask & (input_spectra_mask | input_phot_mask).astype(bool)
 
         return (
             wl,
@@ -384,27 +400,28 @@ class SpectraPlotter(Plotter):
         )
 
         # ~(~input_mask & input_wl_mask)
+        # Coerce all masks to boolean
+        _in_mask = (input_mask != 0)
+        _in_wl_mask = (input_wl_mask != 0)
+        _in_spec_mask = (input_spec_mask != 0)
+        _in_sn_mask = (input_sn_mask != 0)
+
         # Extracts unmasked wavelengths from the valid wavelength range provided by wl_mask
         valid_wl_mask = np.logical_not(
-            np.logical_and(np.logical_not(input_mask), input_wl_mask)
+            np.logical_and(np.logical_not(_in_mask), _in_wl_mask)
         )
 
         # Determine which spectra to keep
-        # Will mask out any spectrum with at least one masked wavelength within the valid wavelength range
         mask_spec = np.logical_and(
-            np.any(valid_wl_mask, axis=-1, keepdims=True), input_spec_mask
+            np.any(valid_wl_mask, axis=-1, keepdims=True), _in_spec_mask
         )
 
         # Determine which SNe to keep
-        # Will mask out any SN with *no* unmasked spectra
         mask_sn = np.logical_and(
-            np.any(mask_spec, axis=-2, keepdims=True), input_sn_mask
+            np.any(mask_spec, axis=-2, keepdims=True), _in_sn_mask
         )
 
-        summary_mask = np.logical_not(input_mask & mask_spec & mask_sn)
-        x = np.ma.masked_array(wl, summary_mask).mean(axis=(0, 1))
-        y = np.ma.masked_array(amplitude, summary_mask)
-        yerr = np.ma.masked_array(sigma, summary_mask)
+        summary_mask = np.logical_not(_in_mask & mask_spec & mask_sn)
 
         # Mean
         scale = (~y.mask).sum(axis=(0, 1))
