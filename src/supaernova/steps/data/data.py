@@ -792,9 +792,9 @@ class Data(Step[DataConfig]):
             )
         # Get spectral data parameters
         spectral_data_params = {
-            "amplitude": ("flux", -np.inf * np.ones(self.wl_dim)),
-            "sigma": ("sigma", -np.inf * np.ones(self.wl_dim)),
-            "salt_flux": ("salt_flux", -np.inf * np.ones(self.wl_dim)),
+            "amplitude": ("flux", np.zeros(self.wl_dim, dtype=np.float32)),
+            "sigma": ("sigma", np.ones(self.wl_dim, dtype=np.float32)),
+            "salt_flux": ("salt_flux", np.zeros(self.wl_dim, dtype=np.float32)),
         }
 
         for data_key, (spectral_data_key, padding) in spectral_data_params.items():
