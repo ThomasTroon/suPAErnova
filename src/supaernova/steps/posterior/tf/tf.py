@@ -884,7 +884,12 @@ class TFPosteriorModel(ks.Model):
         *,
         save_map: bool = False,
         save_hmc: bool = False,
+        clear: bool = True,
     ) -> None:
+        # ``clear`` drops every traced ConcreteFunction (+ gc). Skip it when
+        # checkpointing inside a hot loop (e.g. per MAP chain) so the shared
+        # ``vals_and_grads`` / sampler graphs survive to the next iteration;
+        # the caller clears once when the whole phase is done.
         (savepath / self.ckpt_path).mkdir(parents=True, exist_ok=True)
 
         if save_map and save_hmc:
@@ -900,7 +905,8 @@ class TFPosteriorModel(ks.Model):
 
         ckpt.save(f"{savepath / self.ckpt_path}/")
 
-        clear_session()
+        if clear:
+            clear_session()
 
     def load_checkpoint(
         self,
@@ -1325,17 +1331,7 @@ class TFPosteriorModel(ks.Model):
 
             initial_position = self.map.position.current
             initial_position = self.map.unconstrain(initial_position)
-            log_prob = self(
-                self.map.get_position(initial_position),
-                training=False,
-                input_phase=self.data_time,
-                input_amp=self.data_amplitude,
-                input_sigma=self.data_sigma,
-                mask=self.data_mask,
-                sn_mask=self.sn_mask,
-                spec_mask=self.spec_mask,
-                wl_mask=self.wl_mask,
-            )
+            log_prob = self._forward(self.map.get_position(initial_position))
             num_log_prob = tf.where(
                 tf.math.is_finite(log_prob),
                 tf.ones_like(log_prob),
@@ -1398,24 +1394,9 @@ class TFPosteriorModel(ks.Model):
                 (objective_value < self.map.negative_log_prob), converged
             )
 
-        _val, _grad = tfp.math.value_and_gradient(
-            self.vals_and_grads,
-            initial_position,
-            auto_unpack_single_arg=False,
-        )
-
         final_position = self.map.get_position(self.map.unconstrain(position))
-        log_prob, log_like, log_prior, _, _ = self(
-            final_position,
-            training=False,
-            input_phase=self.data_time,
-            input_amp=self.data_amplitude,
-            input_sigma=self.data_sigma,
-            mask=self.data_mask,
-            sn_mask=self.sn_mask,
-            spec_mask=self.spec_mask,
-            wl_mask=self.wl_mask,
-            additional_outputs=True,
+        log_prob, log_like, log_prior, _, _ = self._forward(
+            final_position, additional_outputs=True
         )
 
         self.map.improved.assign(improved)
@@ -1645,8 +1626,9 @@ class TFPosteriorModel(ks.Model):
 
         if savepath is not None:
             (stage_savepath / self.ckpt_path).mkdir(parents=True, exist_ok=True)
-            self.save_checkpoint(stage_savepath, save_map=True)
-        clear_session()
+            # Keep the traced graphs alive across MAP chains -- train_model
+            # clears once when every stage/chain is done.
+            self.save_checkpoint(stage_savepath, save_map=True, clear=False)
 
     # === HMC Functions ===
 
@@ -1656,15 +1638,29 @@ class TFPosteriorModel(ks.Model):
             return max(1, min(total, int(total * raw)))
         return max(1, min(total, int(raw)))
 
-    def unnormalized_posterior_log_prob(
+    def _forward(
         self,
-        *pos: tf.Tensor,
+        position: tf.Tensor,
+        *,
         additional_outputs: bool = False,
-    ) -> tf.Tensor | tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+    ) -> tf.Tensor | tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+        """Run ``call`` with the model's own (subset-restricted) data tensors.
 
-        input_position = self.map.get_position(tf.convert_to_tensor(pos)[0, ...])
-        log_prob, log_like, log_prior, _, _ = self(
-            input_position,
+        A single place to thread ``self.data_*`` / masks into a forward pass;
+        ``ks.Model.__call__`` already graph-compiles ``call`` keyed on input
+        specs, so this is a DRY helper rather than an extra ``tf.function``.
+
+        Args:
+            position: Parameter vector(s) to evaluate, ``[..., n_params]``.
+            additional_outputs: Forwarded to ``call``.
+
+        Returns:
+            ``call``'s output: ``log_probability`` alone, or the
+            ``(log_probability, log_likelihood, log_prior, synth_amp,
+            synth_sigma)`` tuple when ``additional_outputs`` is set.
+        """
+        return self(
+            position,
             training=False,
             input_phase=self.data_time,
             input_amp=self.data_amplitude,
@@ -1673,12 +1669,105 @@ class TFPosteriorModel(ks.Model):
             sn_mask=self.sn_mask,
             spec_mask=self.spec_mask,
             wl_mask=self.wl_mask,
-            additional_outputs=True,
+            additional_outputs=additional_outputs,
+        )
+
+    def unnormalized_posterior_log_prob(
+        self,
+        *pos: tf.Tensor,
+        additional_outputs: bool = False,
+    ) -> tf.Tensor | tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+
+        input_position = self.map.get_position(tf.convert_to_tensor(pos)[0, ...])
+        log_prob, log_like, log_prior, _, _ = self._forward(
+            input_position, additional_outputs=True
         )
 
         if additional_outputs:
             return log_prior, log_like, log_prob
         return log_prob
+
+    def _recompute_sample_diagnostics(
+        self, samples: tf.Tensor
+    ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+        """Log-prior/like/prob and z-latents for every recorded HMC sample.
+
+        ``samples`` is ``[n_run_steps, n_walkers, sn, n_params]``. ``call`` and
+        ``get_position`` broadcast over a single leading axis, so the
+        (steps, walkers) axes are folded into one batch axis and the run is
+        evaluated a group of steps at a time -- fewer, larger forward passes
+        than the old sequential ``tf.map_fn`` over the ``n_run_steps`` axis,
+        while each pass stays close to the per-step sampling footprint so
+        peak decoder memory does not blow up.
+
+        The group size starts at ``_recompute_step_batch`` recorded steps and
+        halves on OOM, down to a single step (which matches what the sampler
+        itself held).
+
+        Args:
+            samples: Constrained sample tensor from ``_sample_hmc``.
+
+        Returns:
+            ``(log_prior, log_like, log_prob, zs)``; the log terms are
+            ``[n_run_steps, n_walkers, sn]`` and ``zs`` is
+            ``[n_run_steps, n_walkers, sn, n_flow_latents]``.
+
+        Raises:
+            tf.errors.ResourceExhaustedError: If a single recorded step
+                (``n_walkers`` rows) still does not fit in device memory.
+        """
+        self.log.debug(
+            "Calculating prior, likelihood, and probability across all samples"
+        )
+        n_steps, n_walkers = int(samples.shape[0]), int(samples.shape[1])
+        flat = tf.reshape(samples, (n_steps * n_walkers, *samples.shape[2:]))
+
+        # One recorded step is `n_walkers` rows -- exactly the batch the
+        # sampler's target evaluated per leapfrog step. Group a few steps per
+        # pass; back off to a single step if the GPU can't hold the group.
+        step_batch = int(getattr(self, "_recompute_step_batch", 8))
+        while True:
+            try:
+                parts = self._recompute_pass(flat, max(1, step_batch) * n_walkers)
+                break
+            except tf.errors.ResourceExhaustedError:
+                if step_batch <= 1:
+                    raise
+                step_batch = max(1, step_batch // 2)
+                self.log.warning(
+                    f"OOM in sample-diagnostics recompute; retrying with "
+                    f"step_batch={step_batch}"
+                )
+                clear_session()
+
+        return tuple(  # type: ignore[return-value]
+            tf.reshape(p, (n_steps, n_walkers, *p.shape[1:])) for p in parts
+        )
+
+    def _recompute_pass(
+        self, flat: tf.Tensor, rows: int
+    ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+        """One attempt at the batched recompute: ``rows`` sample-rows per pass.
+
+        Args:
+            flat: Samples flattened to ``[n_steps * n_walkers, sn, n_params]``.
+            rows: Number of sample-rows to evaluate per forward pass.
+
+        Returns:
+            ``(log_prior, log_like, log_prob, zs)`` concatenated over the
+            leading (flattened) axis.
+        """
+        n_flow = self.map.nflow.n_flow_latents
+        stores: list[list[tf.Tensor]] = [[], [], [], []]
+        for start in range(0, int(flat.shape[0]), rows):
+            batch = flat[start : start + rows]
+            lp, ll, lprob = self.unnormalized_posterior_log_prob(
+                batch, additional_outputs=True
+            )
+            zsb = self.map.nflow.u_to_z(batch[..., -n_flow:], permute=True)
+            for store, value in zip(stores, (lp, ll, lprob, zsb), strict=True):
+                store.append(value)
+        return tuple(tf.concat(s, axis=0) for s in stores)  # type: ignore[return-value]
 
     def trace_fn(
         self, _state: tf.Tensor, pkr: "DualAveragingStepSizeAdaptationResults"
@@ -1785,6 +1874,20 @@ class TFPosteriorModel(ks.Model):
         run_states = list(run_states) if run_states is not None else []
         keep_states = phase == "run"
 
+        # The Python chunk loop only earns its keep when it has something to do
+        # between chunks: write a resume checkpoint, or emit per-chunk
+        # TensorBoard summaries. With neither, run the whole phase in one
+        # sample_chain call -- no chunk-boundary retraces, no per-chunk
+        # concat/emit overhead.
+        if not self._checkpoint_hmc and getattr(self, "summary_writer", None) is None:
+            chunk_steps = max(chunk_steps, total_steps)
+
+        # Fresh run phase (not a resume that pre-seeded run_states): drop any
+        # per-chunk state shards left behind by an earlier interrupted run.
+        if keep_states and hmc_savepath is not None and not run_states:
+            for stale in (hmc_savepath / "run").glob("states_*.npy"):
+                stale.unlink()
+
         while steps_done < total_steps:
             n = min(chunk_steps, total_steps - steps_done)
             # No leading gap before the very first recorded step of a phase
@@ -1810,7 +1913,7 @@ class TFPosteriorModel(ks.Model):
                     state=state,
                     pkr=pkr,
                     steps_done=steps_done,
-                    run_states=run_states,
+                    latest_states=all_states if keep_states else None,
                     hmc_savepath=hmc_savepath,
                 )
 
@@ -1840,10 +1943,17 @@ class TFPosteriorModel(ks.Model):
         state: tf.Tensor,
         pkr: "DualAveragingStepSizeAdaptationResults",
         steps_done: int,
-        run_states: "list[tf.Tensor]",
+        latest_states: "tf.Tensor | None",
         hmc_savepath: "Path",
     ) -> None:
-        """Atomically write the intermediate HMC run state after one chunk."""
+        """Atomically write the intermediate HMC run state after one chunk.
+
+        The run phase's recorded states are written as append-only per-chunk
+        shards (``states_<steps_done>.npy``) rather than re-serialising the
+        whole accumulated ``run_states`` list every chunk (which was
+        O(n_chunks^2) in host copies and disk writes). ``_read_hmc_run_state``
+        globs and concatenates the shards on resume.
+        """
         run_dir = hmc_savepath / "run"
         run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1854,8 +1964,13 @@ class TFPosteriorModel(ks.Model):
         }
         for i, leaf in enumerate(leaves):
             arrays[f"pkr_{i}"] = np.asarray(leaf)
-        if phase == "run" and run_states:
-            arrays["run_states"] = np.asarray(tf.concat(run_states, axis=0))
+
+        if phase == "run" and latest_states is not None:
+            shard = run_dir / f"states_{steps_done:09d}.npy"
+            tmp_shard = shard.parent / f"{shard.name}.tmp"
+            with tmp_shard.open("wb") as handle:
+                np.save(handle, np.asarray(latest_states))
+            tmp_shard.replace(shard)
 
         meta = {
             "phase": phase,
@@ -1920,7 +2035,18 @@ class TFPosteriorModel(ks.Model):
             f"Resuming HMC from {run_dir} "
             f"(phase={meta['phase']}, {meta['steps_done']}/{total} steps done)."
         )
-        return {"meta": meta, "data": np.load(npz_path)}
+
+        data = np.load(npz_path)
+        run_states = None
+        shards = sorted(run_dir.glob("states_*.npy"))
+        if shards:
+            run_states = np.concatenate([np.load(shard) for shard in shards], axis=0)
+        elif "run_states" in data.files:
+            # Legacy checkpoint: recorded states lived inside run_state.npz
+            # rather than as append-only shards.
+            run_states = data["run_states"]
+
+        return {"meta": meta, "data": data, "run_states": run_states}
 
     def _hmc_resume_plan(
         self,
@@ -1993,8 +2119,8 @@ class TFPosteriorModel(ks.Model):
                 kernel_run, state, data, meta["n_pkr_leaves"]
             )
             plan["run_steps_done"] = int(meta["steps_done"])
-            if "run_states" in data.files:
-                plan["run_states_seed"] = [tf.constant(data["run_states"])]
+            if resume["run_states"] is not None:
+                plan["run_states_seed"] = [tf.constant(resume["run_states"])]
         elif meta["phase"] == "burnin":
             plan["skip_adaption"] = True
             plan["burnin_state"] = state
@@ -2225,17 +2351,6 @@ class TFPosteriorModel(ks.Model):
         # previous_kernel_results (step size, adaptation step counter, etc.)
         # carries over unaffected, since none of that state depends on
         # max_tree_depth.
-        sampler_burnin = tfp.mcmc.NoUTurnSampler(
-            target_log_prob_fn=self.unnormalized_posterior_log_prob,
-            step_size=step,
-            max_tree_depth=self.n_leapfrog_burnin,
-            parallel_iterations=NPROC,
-        )
-        kernel_burnin = tfp.mcmc.DualAveragingStepSizeAdaptation(
-            inner_kernel=sampler_burnin,
-            num_adaptation_steps=0,
-            target_accept_prob=self.target_acceptance_rate,
-        )
         sampler_run = tfp.mcmc.NoUTurnSampler(
             target_log_prob_fn=self.unnormalized_posterior_log_prob,
             step_size=step,
@@ -2247,6 +2362,25 @@ class TFPosteriorModel(ks.Model):
             num_adaptation_steps=0,
             target_accept_prob=self.target_acceptance_rate,
         )
+        # Reuse the run kernel for burn-in when the tree depth matches -- one
+        # fewer distinct kernel object means one fewer full retrace of the
+        # sample_chain graph. (The pkr state carried across phases doesn't
+        # depend on max_tree_depth, so this is only a construction-time
+        # dedup, not a behaviour change.)
+        if self.n_leapfrog_burnin == self.n_leapfrog_run:
+            kernel_burnin = kernel_run
+        else:
+            sampler_burnin = tfp.mcmc.NoUTurnSampler(
+                target_log_prob_fn=self.unnormalized_posterior_log_prob,
+                step_size=step,
+                max_tree_depth=self.n_leapfrog_burnin,
+                parallel_iterations=NPROC,
+            )
+            kernel_burnin = tfp.mcmc.DualAveragingStepSizeAdaptation(
+                inner_kernel=sampler_burnin,
+                num_adaptation_steps=0,
+                target_accept_prob=self.target_acceptance_rate,
+            )
 
         plan = self._hmc_resume_plan(
             hmc_savepath, position, kernel_adaption, kernel_burnin, kernel_run
@@ -2323,7 +2457,11 @@ class TFPosteriorModel(ks.Model):
         )
         # run_trace = (step_size, reach_max_depth, is_accepted,
         #              has_divergence, lp_min, lp_mean, lp_max)
-        self.report_run_diagnostics(run_trace[1], run_trace[2], run_trace[3])
+        # run_trace is None when the run phase ran no chunks -- i.e. it was
+        # already complete on resume (all recorded states came from the
+        # checkpoint); there are then no fresh diagnostics to report.
+        if run_trace is not None:
+            self.report_run_diagnostics(run_trace[1], run_trace[2], run_trace[3])
         return self.map.constrain(all_states)
 
     def train_hmc(
@@ -2360,17 +2498,18 @@ class TFPosteriorModel(ks.Model):
         )
 
         self.summary_writer = None
+        self.sample_progress = None
         if self.profile and savepath is not None:
             log_dir = savepath.parent / self.log_path / savepath.stem / "hmc"
             self.summary_writer = tf.summary.create_file_writer(
                 str(log_dir),
             )
-        self.sample_progress = tqdm(
-            total=n_total_steps,
-            leave=False,
-            dynamic_ncols=True,
-            position=0,
-        )
+            self.sample_progress = tqdm(
+                total=n_total_steps,
+                leave=False,
+                dynamic_ncols=True,
+                position=0,
+            )
         # hmc_step keys the `hmc/*` TensorBoard charts (shared across burn-in
         # and the run so they form one continuous timeline); sample_step keys
         # `samples/samples/*_log_prob`. Both advance in eager Python from
@@ -2415,39 +2554,20 @@ class TFPosteriorModel(ks.Model):
 
             samples = self._sample_hmc(position, step, hmc_ckpt_path)
 
-            self.sample_progress.close()
+            if self.sample_progress is not None:
+                self.sample_progress.close()
             self.sample_progress = None
             if self.summary_writer is not None:
                 self.summary_writer.close()
             self.summary_writer = None
 
+            # Free the (large) NUTS trajectory graph before the recompute
+            # passes below build their own, smaller trace.
             clear_session()
 
-            self.log.debug(
-                "Calculating prior, likelihood, and probability across all samples"
+            log_prior, log_like, log_prob, zs = self._recompute_sample_diagnostics(
+                samples
             )
-
-            @tf.function
-            def _fn(state):
-                return self.unnormalized_posterior_log_prob(
-                    state, additional_outputs=True
-                )
-
-            log_prior, log_like, log_prob = tf.map_fn(
-                _fn,
-                tf.convert_to_tensor(samples),
-                swap_memory=True,
-                fn_output_signature=(tf.float32, tf.float32, tf.float32),
-            )
-
-            self.log.debug("Calculating z-latents")
-
-            @tf.function
-            def _fn(u):
-                return self.map.nflow.u_to_z(u, permute=True)
-
-            us = samples[..., -self.map.nflow.n_flow_latents :]
-            zs = tf.map_fn(_fn, us, swap_memory=True)
 
         if valid_indices is not None:
             samples = self._scatter_sn(
