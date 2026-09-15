@@ -211,7 +211,7 @@ class TFPAEEncoder(ks.layers.Layer):
         )[..., 0]
 
         # The number of unmasked SNe
-        n_unmasked_sn = tf.math.count_nonzero(mask_sn[:, 0], dtype=tf.float32)
+        n_unmasked_sn = tf.math.maximum(tf.math.count_nonzero(mask_sn[:, 0], dtype=tf.float32), 1.0)
 
         # Determine which latents to keep
         # The latents are ordered by training stage
@@ -540,6 +540,8 @@ class TFPAEDecoder(ks.layers.Layer):
                 phot_mask,
             )
         ):
+            tf.print("\n--- DECODER TRACE ---")
+            tf.print("Pre-photometry NaN:", tf.reduce_any(tf.math.is_nan(synth_amp)))
             (
                 synth_amp,
                 _,
@@ -552,6 +554,8 @@ class TFPAEDecoder(ks.layers.Layer):
                 spectra_mask,
                 phot_mask,
             )
+            tf.print("Post-photometry NaN:", tf.reduce_any(tf.math.is_nan(synth_amp)))
+            synth_amp = tf.where(tf.math.is_nan(synth_amp), tf.zeros_like(synth_amp), synth_amp)
         return synth_amp
 
 
@@ -762,6 +766,8 @@ class TFPAEModel(ks.Model):
             training=training,
             testing=testing,
         )
+        tf.print("\n--- ENCODER TRACE ---")
+        tf.print("Encoder output NaN:", tf.reduce_any(tf.math.is_nan(encoded)))
 
         decoder_inputs = tf.concat((input_phase, encoded), axis=-1)
 
@@ -929,7 +935,12 @@ class TFPAEModel(ks.Model):
         self._loss = loss
 
         pred_loss = loss(y_true=input_amp, y_pred=output_amp)
-        model_loss = tf.reduce_sum(self.losses)
+                # --- SAFEGUARD INTERNAL KERAS LOSSES ---
+        if self.losses:
+            safe_losses = [tf.where(tf.math.is_nan(l), tf.zeros_like(l), l) for l in self.losses]
+            model_loss = tf.reduce_sum(safe_losses)
+        else:
+            model_loss = tf.constant(0.0, dtype=tf.float32)
 
         loss_terms = {
             self.pred_loss_tracker.name: pred_loss,
@@ -998,9 +1009,7 @@ class TFPAEModel(ks.Model):
         if self.loss_covariance_penalty > 0:
             eps = ks.backend.epsilon()
             mask_latents = mask_sn
-            n_unmasked_latents = tf.math.count_nonzero(
-                mask_latents[:, 0], dtype=tf.float32
-            )
+            n_unmasked_latents = tf.math.maximum(tf.math.count_nonzero(mask_latents[:, 0], dtype=tf.float32), 1.0)
             masked_latents = tf.where(
                 mask_latents, latents[:, 0, :], tf.zeros_like(latents[:, 0, :])
             )
@@ -1070,6 +1079,9 @@ class TFPAEModel(ks.Model):
             loss_covariance_penalty = self.loss_covariance_penalty * loss_cov
             loss_terms[self.cov_loss_tracker.name] = loss_covariance_penalty
 
+        tf.print("\n--- LOSS TERM DIAGNOSTICS ---")
+        for k, v in loss_terms.items():
+            tf.print(k, "is NaN:", tf.math.is_nan(v), "| Value:", v)
         total_loss = tf.add_n(loss_terms.values())
         loss_terms[self.loss_tracker.name] = total_loss
 
@@ -1272,7 +1284,7 @@ class TFPAEModel(ks.Model):
         mask_sn = tf.logical_and(
             tf.math.reduce_any(mask_spec, axis=-2, keepdims=True), sn_mask
         )[..., 0]
-        n_unmasked_sn = tf.math.count_nonzero(mask_sn[:, 0], dtype=tf.float32)
+        n_unmasked_sn = tf.math.maximum(tf.math.count_nonzero(mask_sn[:, 0], dtype=tf.float32), 1.0)
 
         # latents_mean = tf.nn.weighted_moments(
         #     encoded, [0], n_unmasked_spec * tf.cast(mask_sn, tf.float32)
@@ -1403,7 +1415,7 @@ class TFPAEModel(ks.Model):
                 tf.where(
                     self.stage.spec_mask,
                     self.stage.data.time,
-                    -HUGE * tf.ones_like(self.stage.data.time),
+                    0.0 * tf.ones_like(self.stage.data.time),
                 ),
                 tf.float32,
             ),
@@ -1411,7 +1423,7 @@ class TFPAEModel(ks.Model):
                 tf.where(
                     self.stage.spec_mask,
                     self.stage.data.dphase,
-                    -HUGE * tf.ones_like(self.stage.data.dphase),
+                    0.0 * tf.ones_like(self.stage.data.dphase),
                 ),
                 tf.float32,
             ),
@@ -1419,7 +1431,7 @@ class TFPAEModel(ks.Model):
                 tf.where(
                     self.stage.mask,
                     self.stage.data.amplitude,
-                    -HUGE * tf.ones_like(self.stage.data.amplitude),
+                    0.0 * tf.ones_like(self.stage.data.amplitude),
                 ),
                 tf.float32,
             ),
@@ -1427,7 +1439,7 @@ class TFPAEModel(ks.Model):
                 tf.where(
                     self.stage.mask,
                     self.stage.data.sigma,
-                    -HUGE * tf.ones_like(self.stage.data.sigma),
+                    0.0 * tf.ones_like(self.stage.data.sigma),
                 ),
                 tf.float32,
             ),
@@ -1449,7 +1461,7 @@ class TFPAEModel(ks.Model):
                 tf.where(
                     self.stage.train_spec_mask,
                     self.stage.train_data.time,
-                    -HUGE * tf.ones_like(self.stage.train_data.time),
+                    0.0 * tf.ones_like(self.stage.train_data.time),
                 ),
                 tf.float32,
             ),
@@ -1457,7 +1469,7 @@ class TFPAEModel(ks.Model):
                 tf.where(
                     self.stage.train_spec_mask,
                     self.stage.train_data.dphase,
-                    -HUGE * tf.ones_like(self.stage.train_data.dphase),
+                    0.0 * tf.ones_like(self.stage.train_data.dphase),
                 ),
                 tf.float32,
             ),
@@ -1465,7 +1477,7 @@ class TFPAEModel(ks.Model):
                 tf.where(
                     self.stage.train_mask,
                     self.stage.train_data.amplitude,
-                    -HUGE * tf.ones_like(self.stage.train_data.amplitude),
+                    0.0 * tf.ones_like(self.stage.train_data.amplitude),
                 ),
                 tf.float32,
             ),
@@ -1473,7 +1485,7 @@ class TFPAEModel(ks.Model):
                 tf.where(
                     self.stage.train_mask,
                     self.stage.train_data.sigma,
-                    -HUGE * tf.ones_like(self.stage.train_data.sigma),
+                    0.0 * tf.ones_like(self.stage.train_data.sigma),
                 ),
                 tf.float32,
             ),
@@ -1495,7 +1507,7 @@ class TFPAEModel(ks.Model):
                 tf.where(
                     self.stage.test_spec_mask,
                     self.stage.test_data.time,
-                    -HUGE * tf.ones_like(self.stage.test_data.time),
+                    0.0 * tf.ones_like(self.stage.test_data.time),
                 ),
                 tf.float32,
             ),
@@ -1503,7 +1515,7 @@ class TFPAEModel(ks.Model):
                 tf.where(
                     self.stage.test_spec_mask,
                     self.stage.test_data.dphase,
-                    -HUGE * tf.ones_like(self.stage.test_data.dphase),
+                    0.0 * tf.ones_like(self.stage.test_data.dphase),
                 ),
                 tf.float32,
             ),
@@ -1511,7 +1523,7 @@ class TFPAEModel(ks.Model):
                 tf.where(
                     self.stage.test_mask,
                     self.stage.test_data.amplitude,
-                    -HUGE * tf.ones_like(self.stage.test_data.amplitude),
+                    0.0 * tf.ones_like(self.stage.test_data.amplitude),
                 ),
                 tf.float32,
             ),
@@ -1519,7 +1531,7 @@ class TFPAEModel(ks.Model):
                 tf.where(
                     self.stage.test_mask,
                     self.stage.test_data.sigma,
-                    -HUGE * tf.ones_like(self.stage.test_data.sigma),
+                    0.0 * tf.ones_like(self.stage.test_data.sigma),
                 ),
                 tf.float32,
             ),
@@ -1541,7 +1553,7 @@ class TFPAEModel(ks.Model):
                 tf.where(
                     self.stage.val_spec_mask,
                     self.stage.val_data.time,
-                    -HUGE * tf.ones_like(self.stage.val_data.time),
+                    0.0 * tf.ones_like(self.stage.val_data.time),
                 ),
                 tf.float32,
             ),
@@ -1549,7 +1561,7 @@ class TFPAEModel(ks.Model):
                 tf.where(
                     self.stage.val_spec_mask,
                     self.stage.val_data.dphase,
-                    -HUGE * tf.ones_like(self.stage.val_data.dphase),
+                    0.0 * tf.ones_like(self.stage.val_data.dphase),
                 ),
                 tf.float32,
             ),
@@ -1557,7 +1569,7 @@ class TFPAEModel(ks.Model):
                 tf.where(
                     self.stage.val_mask,
                     self.stage.val_data.amplitude,
-                    -HUGE * tf.ones_like(self.stage.val_data.amplitude),
+                    0.0 * tf.ones_like(self.stage.val_data.amplitude),
                 ),
                 tf.float32,
             ),
@@ -1565,7 +1577,7 @@ class TFPAEModel(ks.Model):
                 tf.where(
                     self.stage.val_mask,
                     self.stage.val_data.sigma,
-                    -HUGE * tf.ones_like(self.stage.val_data.sigma),
+                    0.0 * tf.ones_like(self.stage.val_data.sigma),
                 ),
                 tf.float32,
             ),
@@ -1806,13 +1818,13 @@ class TFPAEModel(ks.Model):
                 self.mask_fraction * tf.cast(n_unmasked_spectra_per_sn, tf.float32),
                 tf.int32,
             )
-            spec_inds = tf.repeat(
-                tf.expand_dims(tf.range(unmasked_spectra.shape[-1]), axis=0),
-                repeats=unmasked_spectra.shape[0],
-                axis=0,
-            )
+            #spec_inds = tf.repeat(
+                #tf.expand_dims(tf.range(unmasked_spectra.shape[-1]), axis=0),
+               # repeats=unmasked_spectra.shape[0],
+                #axis=0,
+            #)
 
-            unshuffled_mask = spec_inds >= n_spectra_to_mask_per_sn
+            #unshuffled_mask = spec_inds >= n_spectra_to_mask_per_sn
 
             n_total = tf.shape(unmasked_spectra)[-1]
 
