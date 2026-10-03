@@ -149,6 +149,7 @@ class DataConfig(StepConfig):
     colourlaw: Path | None = None
     filters: list[Path] | None = None
     n_phot: NonNegativeInt | Literal[-1] = -1
+    min_spec_dim: NonNegativeInt = 0
     n_spectra: NonNegativeInt | Literal[-1] = -1
     analysis: DataStepAnalysis | None = None
     cosmological_model: str = "WMAP7"

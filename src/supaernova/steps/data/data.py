@@ -118,7 +118,6 @@ class Data(Step[DataConfig]):
 
         self.n_phot: int  # Created in self.prepare_data_arrays
         self.n_spectra: int  # Created in self.prepare_data_arrays
-
         # === Result Variables ===
         self.results: DataStepResult
 
@@ -660,9 +659,13 @@ class Data(Step[DataConfig]):
         self.nspectra_per_sn = np.array(
             [len(spectra) for spectra in self.sne["spectra"]],
         )
-        self.spec_dim = int(self.nspectra_per_sn.max())
+        data_max_spec = int(self.nspectra_per_sn.max())
+        self.spec_dim = max(data_max_spec, self.options.min_spec_dim)
         self.log.debug(
-            f"Maximum number of observations for any given SN: {self.spec_dim}",
+            f"Maximum number of observations for any given SN: {data_max_spec}",
+        )
+        self.log.debug(
+            f"Spectral dimension used for arrays (min_spec_dim={self.options.min_spec_dim}): {self.spec_dim}",
         )
 
         # Wavelength grid
@@ -779,9 +782,9 @@ class Data(Step[DataConfig]):
         max_id_len = max(len(spectra["id"]) for spectra in self.sne["spectra"])
         spectra_params = {
             "spectra_id": ("id", np.str_("-" * max_id_len)),
-            "phase": ("phase", np.float32(-np.inf)),
-            "wl_mask_min": ("wl_mask_min", np.float32(np.inf)),
-            "wl_mask_max": ("wl_mask_max", np.float32(-np.inf)),
+            "phase": ("phase", np.float32(0.0)),
+            "wl_mask_min": ("wl_mask_min", np.float32(3300.0)),
+            "wl_mask_max": ("wl_mask_max", np.float32(8600.0)),
             "filt": ("filt", None),
         }
 
@@ -792,9 +795,9 @@ class Data(Step[DataConfig]):
             )
         # Get spectral data parameters
         spectral_data_params = {
-            "amplitude": ("flux", -np.inf * np.ones(self.wl_dim)),
-            "sigma": ("sigma", -np.inf * np.ones(self.wl_dim)),
-            "salt_flux": ("salt_flux", -np.inf * np.ones(self.wl_dim)),
+            "amplitude": ("flux", np.zeros(self.wl_dim, dtype=np.float32)),
+            "sigma": ("sigma", 1e4 * np.ones(self.wl_dim, dtype=np.float32)),
+            "salt_flux": ("salt_flux", np.zeros(self.wl_dim, dtype=np.float32)),
         }
 
         for data_key, (spectral_data_key, padding) in spectral_data_params.items():
@@ -1006,6 +1009,11 @@ class Data(Step[DataConfig]):
             )
             amp = amp.numpy()
             sigma = sigma.numpy()
+            
+            # --- PREVENT TENSORFLOW DIVISION BY ZERO ---
+            # Floor all sigma values to prevent infs during TF eager execution
+            sigma[sigma < 1e-4] = 1e4
+            
             amp[~data["mask"].astype(bool)] = 0
             data["amplitude"] = amp
             data["sigma"] = sigma
