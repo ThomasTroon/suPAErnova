@@ -857,8 +857,13 @@ class Data(Step[DataConfig]):
             # and its own phase is within the valid phase window; push everything
             # else to the back of the ranking so a masked-out row can never win.
             valid_mask = (sn_mask & spec_mask)[..., 0]
+            # Padded slots carry phase 0 ("at peak") and would otherwise rank ahead of
+            # every real spectrum; rank real slots first.
+            real_slot = (
+                np.arange(self.spec_dim)[None, :] < self.nspectra_per_sn[:, None]
+            )
             phase_for_rank = np.where(
-                valid_mask, np.abs(data["phase"][..., 0]), np.inf
+                valid_mask & real_slot, np.abs(data["phase"][..., 0]), np.inf
             )
             # Rank each SN's spectra by |phase|, closest to peak first, same as sim.py
             phase_rank = np.argsort(np.argsort(phase_for_rank, axis=-1), axis=-1)
