@@ -425,24 +425,28 @@ class SpectraPlotter(Plotter):
 
         # Mean
         scale = (~y.mask).sum(axis=(0, 1))
-        y_mean = y.sum(axis=(0, 1)) / scale
-        yerr_mean = np.ma.sqrt((yerr * yerr).sum(axis=(0, 1))) / scale
-        y_var = ((y - y_mean) ** 2).sum(axis=(0, 1)) / scale
+        safe_scale = np.where(scale == 0, 1, scale)
+        y_mean = y.sum(axis=(0, 1)) / safe_scale
+        y_mean = np.ma.masked_array(y_mean, mask=(scale == 0))
+        yerr_mean = np.ma.sqrt((yerr * yerr).sum(axis=(0, 1))) / safe_scale
+        yerr_mean = np.ma.masked_array(yerr_mean, mask=(scale == 0))
+        y_var = ((y - y_mean) ** 2).sum(axis=(0, 1)) / safe_scale
         y_std = np.sqrt(y_var)
-        y_sem = np.sqrt(y_var / scale)
+        y_sem = np.sqrt(y_var / safe_scale)
 
         order = np.argsort(x)
         x = x[order]
         y_mean = y_mean[order]
         y_std = y_std[order]
         yerr_mean = yerr_mean[order]
+
         fig, ax, ebar = Plotter.errorbar(
             x,
             y_mean,
             *args,
             fig=fig,
             ax=ax,
-            yerr=yerr_mean,
+            yerr=None if save else yerr_mean,
             linestyle="-",
             zorder=10,
             **kwargs,
@@ -496,6 +500,18 @@ class SpectraPlotter(Plotter):
             or np.abs(y_mean - y_std).max() > symlog_max
         ):
             ax.set_yscale("symlog", linthresh=symlog_max, linscale=symlog_scale)
+
+        # Crop the zero-padded tails
+        ax.set_xlim(3600, 7800)
+
+        # Zoom y-axis tightly around the actual data distribution
+        valid_y = (y_mean + y_std).compressed()
+        if len(valid_y) > 0:
+            y_plot_min = (y_mean - y_std).min()
+            y_plot_max = (y_mean + y_std).max()
+            pad = 0.1 * (y_plot_max - y_plot_min) if y_plot_max > y_plot_min else 0.01
+            ax.set_ylim(y_plot_min - pad, y_plot_max + pad)
+
         leg = ax.legend(bbox_to_anchor=(1.0, 1.0))
         leg.set_in_layout(False)
         # Trigger a draw so that constrained layout is executed once
@@ -550,12 +566,13 @@ class SpectraPlotter(Plotter):
             wl_mask=wl_mask,
         )
 
-        input_mask = np.logical_not(input_mask)
-        base_mask = config.base_mask if config.base_mask is not None else input_mask
+        # Correct mask logic: masked array expects True for elements to be masked (ignored)
+        invalid_mask = np.logical_not(input_mask)
+        base_mask = config.base_mask if config.base_mask is not None else invalid_mask
 
-        x = np.ma.masked_array(wl, input_mask).mean(axis=(0, 1))
-        y = np.ma.masked_array(amplitude, input_mask)
-        yerr = np.ma.masked_array(sigma, input_mask)
+        x = np.ma.masked_array(wl, invalid_mask).mean(axis=(0, 1))
+        y = np.ma.masked_array(amplitude, invalid_mask)
+        yerr = np.ma.masked_array(sigma, invalid_mask)
         x_prime = np.ma.masked_array(config.base_wl, base_mask).mean(axis=(0, 1))
         y_prime = np.ma.masked_array(config.base_amp, base_mask)
         yerr_prime = np.ma.masked_array(config.base_sigma, base_mask)
@@ -591,26 +608,32 @@ class SpectraPlotter(Plotter):
 
         # Mean
         scale = (~y.mask).sum(axis=(0, 1))
-        y_mean = y.sum(axis=(0, 1)) / scale
-        yerr_mean = np.ma.sqrt((yerr * yerr).sum(axis=(0, 1))) / scale
-        y_var = ((y - y_mean) ** 2).sum(axis=(0, 1)) / scale
+        safe_scale = np.where(scale == 0, 1, scale)
+        y_mean = y.sum(axis=(0, 1)) / safe_scale
+        y_mean = np.ma.masked_array(y_mean, mask=(scale == 0))
+        yerr_mean = np.ma.sqrt((yerr * yerr).sum(axis=(0, 1))) / safe_scale
+        yerr_mean = np.ma.masked_array(yerr_mean, mask=(scale == 0))
+        y_var = ((y - y_mean) ** 2).sum(axis=(0, 1)) / safe_scale
         y_std = np.sqrt(y_var)
-        y_sem = np.sqrt(y_var / scale)
+        y_sem = np.sqrt(y_var / safe_scale)
 
         order_prime = np.argsort(x_prime)
         x_prime = x_prime[order_prime]
         y_prime = y_prime[..., order_prime]
         yerr_prime = yerr_prime[..., order_prime]
 
-        # Weighted Mean
+        # Weighted Mean for Base with safe scale
         scale_prime = (~y_prime.mask).sum(axis=(0, 1))
-        y_prime_mean = y_prime.sum(axis=(0, 1)) / scale_prime
+        safe_scale_prime = np.where(scale_prime == 0, 1, scale_prime)
+        y_prime_mean = y_prime.sum(axis=(0, 1)) / safe_scale_prime
+        y_prime_mean = np.ma.masked_array(y_prime_mean, mask=(scale_prime == 0))
         yerr_prime_mean = (
-            np.ma.sqrt((yerr_prime * yerr_prime).sum(axis=(0, 1))) / scale_prime
+            np.ma.sqrt((yerr_prime * yerr_prime).sum(axis=(0, 1))) / safe_scale_prime
         )
-        y_prime_var = ((y_prime - y_prime_mean) ** 2).sum(axis=(0, 1)) / scale_prime
+        yerr_prime_mean = np.ma.masked_array(yerr_prime_mean, mask=(scale_prime == 0))
+        y_prime_var = ((y_prime - y_prime_mean) ** 2).sum(axis=(0, 1)) / safe_scale_prime
         y_prime_std = np.sqrt(y_prime_var)
-        y_prime_sem = np.sqrt(y_prime_var / scale_prime)
+        y_prime_sem = np.sqrt(y_prime_var / safe_scale_prime)
 
         if config.plot_base:
             fig, spectra_ax, _ebar = Plotter.errorbar(
@@ -619,7 +642,7 @@ class SpectraPlotter(Plotter):
                 *args,
                 fig=fig,
                 ax=spectra_ax,
-                yerr=yerr_prime_mean,
+                yerr=None if save else yerr_prime_mean,
                 linestyle="-",
                 color="black",
                 zorder=10,
@@ -669,7 +692,7 @@ class SpectraPlotter(Plotter):
             *args,
             fig=fig,
             ax=spectra_ax,
-            yerr=yerr_mean,
+            yerr=None if save else yerr_mean,
             linestyle="-",
             zorder=10,
             **kwargs,
@@ -729,29 +752,35 @@ class SpectraPlotter(Plotter):
         y_common = y[..., mask_overlap]
         yerr_common = yerr[..., mask_overlap]
         scale_common = (~y_common.mask).sum(axis=(0, 1))
-        y_common_mean = y_common.sum(axis=(0, 1)) / scale_common
+        safe_scale_common = np.where(scale_common == 0, 1, scale_common)
+        y_common_mean = y_common.sum(axis=(0, 1)) / safe_scale_common
+        y_common_mean = np.ma.masked_array(y_common_mean, mask=(scale_common == 0))
         yerr_common_mean = (
-            np.ma.sqrt((yerr_common * yerr_common).sum(axis=(0, 1))) / scale_common
+            np.ma.sqrt((yerr_common * yerr_common).sum(axis=(0, 1))) / safe_scale_common
         )
-        y_common_var = ((y_common - y_common_mean) ** 2).sum(axis=(0, 1)) / scale_common
+        yerr_common_mean = np.ma.masked_array(yerr_common_mean, mask=(scale_common == 0))
+        y_common_var = ((y_common - y_common_mean) ** 2).sum(axis=(0, 1)) / safe_scale_common
         y_common_std = np.sqrt(y_common_var)
-        y_common_sem = np.sqrt(y_common_var / scale_common)
+        y_common_sem = np.sqrt(y_common_var / safe_scale_common)
 
         x_prime_common = x_prime[mask_overlap_prime]
         y_prime_common = y_prime[..., mask_overlap_prime]
         yerr_prime_common = yerr_prime[..., mask_overlap_prime]
 
         scale_prime_common = (~y_prime_common.mask).sum(axis=(0, 1))
-        y_prime_common_mean = y_prime_common.sum(axis=(0, 1)) / scale_prime_common
+        safe_scale_prime_common = np.where(scale_prime_common == 0, 1, scale_prime_common)
+        y_prime_common_mean = y_prime_common.sum(axis=(0, 1)) / safe_scale_prime_common
+        y_prime_common_mean = np.ma.masked_array(y_prime_common_mean, mask=(scale_prime_common == 0))
         yerr_prime_common_mean = (
             np.ma.sqrt((yerr_prime_common * yerr_prime_common).sum(axis=(0, 1)))
-            / scale_prime_common
+            / safe_scale_prime_common
         )
+        yerr_prime_common_mean = np.ma.masked_array(yerr_prime_common_mean, mask=(scale_prime_common == 0))
         y_prime_common_var = ((y_prime_common - y_prime_common_mean) ** 2).sum(
             axis=(0, 1)
-        ) / scale_prime_common
+        ) / safe_scale_prime_common
         y_prime_common_std = np.sqrt(y_prime_common_var)
-        y_prime_common_sem = np.sqrt(y_prime_common_var / scale_prime_common)
+        y_prime_common_sem = np.sqrt(y_prime_common_var / safe_scale_prime_common)
 
         # Residual with masks respected
         y_residual_mean = y_common_mean - y_prime_common_mean
@@ -763,13 +792,16 @@ class SpectraPlotter(Plotter):
         fig, residual_ax, ebar = Plotter.errorbar(
             x_common,
             y_residual_mean,
-            yerr=yerr_residual_mean,
+            yerr=None if save else yerr_residual_mean,
             *args,
             fig=fig,
             ax=residual_ax,
             linestyle="-",
             **kwargs,
         )
+
+        # Ensure residual panel has a stable, centered scale even when residual is 0
+        residual_ax.set_ylim(-0.005, 0.005)
 
         symlog_max = 10
         symlog_scale = 2
@@ -795,6 +827,9 @@ class SpectraPlotter(Plotter):
             **kwargs,
         )
 
+        # Center the pull axis so the 1.0 reference line is visible
+        pull_ax.set_ylim(-0.2, 2.5)
+
         symlog_max = 10
         symlog_scale = 2
         if y_pull_mean.max() > symlog_max:
@@ -813,6 +848,37 @@ class SpectraPlotter(Plotter):
             or np.abs(y_prime_mean - y_prime_std).max() > symlog_max
         ):
             spectra_ax.set_yscale("symlog", linthresh=symlog_max, linscale=symlog_scale)
+
+        # Auto-zoom spectra_ax tightly around the actual data distribution
+        valid_y = (y_mean + y_std).compressed()
+        if len(valid_y) > 0:
+            y_plot_min = (y_mean - y_std).min()
+            y_plot_max = (y_mean + y_std).max()
+            pad = 0.1 * (y_plot_max - y_plot_min) if y_plot_max > y_plot_min else 0.01
+            spectra_ax.set_ylim(y_plot_min - pad, y_plot_max + pad)
+
+        # Restrict residual axis limits when comparing identical runs (residual ~ 0)
+        res_valid = y_residual_mean.compressed()
+        if len(res_valid) > 0:
+            res_min, res_max = res_valid.min(), res_valid.max()
+            if np.isclose(res_min, 0.0, atol=1e-6) and np.isclose(res_max, 0.0, atol=1e-6):
+                residual_ax.set_ylim(-0.01, 0.01)
+            else:
+                r_pad = 0.1 * (res_max - res_min) if res_max > res_min else 0.01
+                residual_ax.set_ylim(res_min - r_pad, res_max + r_pad)
+
+        # Set sensible bounds on pull plot
+        pull_valid = y_pull_mean.compressed()
+        if len(pull_valid) > 0:
+            pull_max = pull_valid.max()
+            pull_ax.set_ylim(-0.1, max(2.0, pull_max * 1.1))
+
+        # Crop boundary noise at the filter extremes
+        spectra_ax.set_xlim(3600, 7800)
+
+        # Give breathing room so zero-lines don't sit flush on spines
+        residual_ax.set_ylim(-0.015, 0.015)
+        pull_ax.set_ylim(-0.15, 2.0)
 
         fig.align_ylabels(ax)
 
