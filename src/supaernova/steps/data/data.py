@@ -939,6 +939,9 @@ class Data(Step[DataConfig]):
             laser_mask = laser_mask | laser_mask_min | laser_mask_max
             laser_width -= 1
 
+        if not no_filt_defined:
+            # Photometric rows are single-bin spikes by construction; never treat them as laser lines
+            laser_mask = laser_mask & ~(np.asarray(data["phot_mask"]).astype(bool))
         data["laser_mask"] = laser_mask
         data["mask"] &= ~laser_mask
 
